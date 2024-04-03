@@ -12,6 +12,8 @@ import torchvision.utils as vutils
 from model_clamp import mobilenet_v2
 
 
+IMAGENET_PATH='/root/autodl-tmp/sunbing/workspace/uap/data/imagenet/validation/'
+
 torch.cuda.set_device(0)
 parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', type=int, default=60, help='number of epochs to train for')
@@ -29,6 +31,8 @@ parser.add_argument('--clp', type=float, default=1.0, help='clamp ratio')
 parser.add_argument('--advp', type=int, default=0, help='if using the AdvPatch attack')
 parser.add_argument('--den', type=int, default=1, help='density of clipping')
 parser.add_argument('--model_type', type=int, default=0, help='model architecture, 0 is ResNet-50, 1 is Inception-V3, 2 is MobileNetV2')
+parser.add_argument('--uap_path', default='uap.npy', help='pretrained uap patch to test')
+
 args = parser.parse_args()
 print(args)
 
@@ -50,6 +54,8 @@ class ResNet50(nn.Module):
 
 
     def clamp(self, x, a=1.0):
+        if a == 0:
+            return x
         norm = torch.norm(x, dim=1, keepdim=True)
         thre = torch.mean(torch.mean(a * norm, dim=2, keepdim=True), dim=3, keepdim=True)
         x = x / torch.clamp_min(norm, min=1e-7)
@@ -269,6 +275,26 @@ class Mobile(nn.Module):
         return out
 
 
+def fix_labels(test_set):
+    val_dict = {}
+    groudtruth = os.path.join(IMAGENET_PATH, 'classes.txt')
+
+    i = 0
+    with open(groudtruth) as file:
+        for line in file:
+            (key, class_name) = line.split(':')
+            val_dict[key] = i
+            i = i + 1
+
+    new_data_samples = []
+    for i, j in enumerate(test_set.samples):
+        class_id = test_set.samples[i][0].split('/')[-1].split('.')[0].split('_')[-1]
+        org_label = val_dict[class_id]
+        new_data_samples.append((test_set.samples[i][0], org_label))
+
+    test_set.samples = new_data_samples
+    return test_set
+
 
 if not os.path.exists(args.save + '/' + str(args.target)):
     os.makedirs(args.save + '/' + str(args.target))
@@ -284,40 +310,37 @@ elif args.model_type == 1:
 else:
     net = Mobile()
 
-
-
 if args.cuda:
     net.cuda()
-
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-idx = np.arange(50)
-training_idx = np.array([])
-for i in range(1):
-    training_idx = np.append(training_idx, [idx[i * 50:i * 50 + 10]])
-training_idx = training_idx.astype(np.int32)
 
 im_size = 224
 if args.model_type == 1:
     im_size = 299
 
-train_loader = torch.utils.data.DataLoader(
-    dset.ImageFolder(args.data, transforms.Compose([
-        transforms.Resize(round(im_size * 1.050)),
-        transforms.CenterCrop(im_size),
-        transforms.ToTensor(),
-    ])),
-    batch_size=args.bs, shuffle=False, sampler=None,
-    num_workers=2, pin_memory=True)
 
-test_loader = torch.utils.data.DataLoader(
-    dset.ImageFolder(args.data, transforms.Compose([
-        transforms.Resize(round(im_size * 1.000)),
-        transforms.CenterCrop(im_size),
-        transforms.ToTensor(),
-    ])),
-    batch_size=args.bs, shuffle=False, sampler=None,
-    num_workers=2, pin_memory=True)
+train_transform = transforms.Compose([
+    transforms.Resize(256),
+    #transforms.Resize(299), # inception_v3
+    transforms.RandomCrop(im_size),
+    transforms.ToTensor()
+    #transforms.Normalize(mean, std)
+])
+
+full_val = dset.ImageFolder(root=args.data, transform=train_transform)
+full_val = fix_labels(full_val)
+
+full_index = np.arange(0, len(full_val))
+index_test = np.load(IMAGENET_PATH + '/index_test.npy').astype(np.int64)
+index_train = [x for x in full_index if x not in index_test]
+train_data = torch.utils.data.Subset(full_val, index_train)
+test_data = torch.utils.data.Subset(full_val, index_test)
+print('test size {} train size {}'.format(len(test_data), len(train_data)))
+
+test_loader = torch.utils.data.DataLoader(test_data,
+                                          batch_size=args.bs,
+                                          shuffle=False,
+                                          num_workers=2,
+                                          pin_memory=True)
 
 
 
@@ -454,6 +477,7 @@ def attack(epoch, patch, rxy=None):
 
     return patch
 
+
 def evaluate(epoch, patch, rxy=None):
     net.eval()
     total = 0
@@ -477,6 +501,27 @@ def evaluate(epoch, patch, rxy=None):
         accu += (pre == labels).type(torch.float32).sum()
     print('Epoch:{:3d}, Classify Accuracy:{:.2f}, Target Success:{:.2f}'.format(epoch, accu / total * 100, succ / total * 100))
 
+
+def evaluate_net(patch):
+    net.eval()
+    total = 0
+    accu = 0.
+    succ = 0.
+    for batch_idx, (data, labels) in enumerate(test_loader):
+        if args.cuda:
+            data, labels = data.cuda(), labels.cuda()
+            patch = patch.cuda()
+
+        total += data.shape[0]
+        adv = (data + patch).float()
+        adv_out = F.softmax(net(adv), dim=1)
+        pre = torch.argmax(adv_out, dim=1)
+
+        succ += (pre == args.target).type(torch.float32).sum()
+        accu += (pre == labels).type(torch.float32).sum()
+    print('Classify Accuracy:{:.2f}, Target Success:{:.2f}'.format(accu / total * 100, succ / total * 100))
+
+
 def evaluate_clean():
     net.eval()
     total = 0
@@ -496,13 +541,11 @@ def evaluate_clean():
 
 
 if __name__ == '__main__':
-    lr = 1.0
     evaluate_clean()
-    '''
-    patch, _, _ = InitPatchB([1, 3, im_size, im_size], args.p_size)
+    #load uap
+    uap_fn = os.path.join(args.uap_path, 'uap_' + str(args.target) + '.npy')
+    uap = np.load(uap_fn)
+    tuap = torch.from_numpy(uap)
+    evaluate_net(tuap)
 
-    for i in range(args.epoch):
-        if i == 30:
-            lr = lr / 2.
-        patch = attack(i, patch)
-    '''
+

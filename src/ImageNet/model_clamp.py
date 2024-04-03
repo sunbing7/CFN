@@ -5,8 +5,8 @@ from collections import OrderedDict
 import torch.utils.checkpoint as cp
 from torch import Tensor
 import torchvision
-from torchvision.models.utils import load_state_dict_from_url
-import re
+#from torchvision.models.utils import load_state_dict_from_url
+from torch.hub import load_state_dict_from_url
 
 model_urls = {
     'densenet121': 'https://download.pytorch.org/models/densenet121-a639ec97.pth',
